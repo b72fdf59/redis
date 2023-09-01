@@ -75,8 +75,12 @@ static int32_t one_request(int connfd)
     msg("too long");
     return -1;
   }
-  printf("client length: %d\n", len);
 
+  err = read_full(connfd, &rbuf[4], len);
+  if (err) {
+    msg("read() error");
+    return err;
+  }
 
   // request body
   rbuf[4 + len] = '\0';
@@ -135,7 +139,7 @@ int main()
     while (true)
     {
       int32_t err = one_request(connfd);
-      if (err < 1)
+      if (err)
       {
         break;
       }
