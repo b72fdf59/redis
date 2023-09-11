@@ -1,6 +1,6 @@
 client: client.cpp
-	gcc -Wall -Wextra -g client.cpp -o client  
+	g++ -Wall -Wextra -g client.cpp -o client  
 
 
 server: server.cpp
-	gcc -Wall -Wextra -g server.cpp -o server  
+	g++ -Wall -Wextra -g server.cpp -o server  
