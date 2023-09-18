@@ -1,16 +1,22 @@
 #include <arpa/inet.h>
 #include <assert.h>
+#include <cstring>
 #include <errno.h>
 #include <fcntl.h>
+#include <iostream>
 #include <netinet/ip.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
+
+#define MAX_EVENTS 64
 
 static void msg(const char *msg) { fprintf(stderr, "%s\n", msg); }
 
@@ -253,53 +259,83 @@ int main() {
   // set the listen fd to nonblocking mode
   fd_set_nb(fd);
 
+  // create epoll
+  int epoll_fd = epoll_create1(0);
+  if (epoll_fd == -1) {
+    die("epoll()");
+  }
+
+  struct epoll_event event;
+  event.events = EPOLLIN;
+  event.data.fd = fd;
+  rv = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event);
+  if (rv < 0) {
+    die("epoll_ctl(add)");
+  }
+
+  std::vector<struct epoll_event> epoll_events(MAX_EVENTS);
+
   // the event loop
-  std::vector<struct pollfd> poll_args;
   while (true) {
-    // prepare the arguments of the poll()
-    poll_args.clear();
-    // for convenience, the listening fd is put in the first position
-    struct pollfd pfd = {fd, POLLIN, 0};
-    poll_args.push_back(pfd);
     // connection fds
     for (Conn *conn : fd2conn) {
       if (!conn) {
         continue;
       }
-      struct pollfd pfd = {};
-      pfd.fd = conn->fd;
-      pfd.events = (conn->state == STATE_REQ) ? POLLIN : POLLOUT;
-      pfd.events = pfd.events | POLLERR;
-      poll_args.push_back(pfd);
-    }
 
-    // poll for active fds
-    // the timeout argument doesn't matter here
-    int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), 1000);
-    if (rv < 0) {
-      die("poll");
-    }
-
-    // process active connections
-    for (size_t i = 1; i < poll_args.size(); ++i) {
-      if (poll_args[i].revents) {
-        Conn *conn = fd2conn[poll_args[i].fd];
-        connection_io(conn);
-        if (conn->state == STATE_END) {
-          // client closed normally, or something bad happened.
-          // destroy this connection
-          fd2conn[conn->fd] = NULL;
-          (void)close(conn->fd);
-          free(conn);
+      errno = 0;
+      struct epoll_event event;
+      event.data.fd = conn->fd;
+      event.events = (conn->state == STATE_REQ) ? POLLIN : POLLOUT;
+      event.events = event.events | POLLERR;
+      int rv = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &event);
+      std::cout << rv << std::endl;
+      if (rv < 0) {
+        if (errno == ENOENT) {
+          rv = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn->fd, &event);
+          if (rv < 0) {
+            die("epoll(add)");
+          }
+        } else {
+          die("epoll(mod)");
         }
       }
     }
 
-    // try to accept a new connection if the listening fd is active
-    if (poll_args[0].revents) {
-      (void)accept_new_conn(fd2conn, fd);
+    // poll for active fds
+    // the timeout argument doesn't matter here
+    ssize_t nfds =
+        epoll_wait(epoll_fd, epoll_events.data(), epoll_events.size(), -1);
+    if (nfds < 0) {
+      die("poll");
+    }
+
+    // process active connections
+    for (size_t i = 0; i < (size_t)nfds; ++i) {
+      // try to accept a new connection if the listening fd is active
+      if (epoll_events[i].data.fd == fd) {
+        (void)accept_new_conn(fd2conn, fd);
+        continue;
+      }
+
+      Conn *conn = fd2conn[epoll_events[i].data.fd];
+      connection_io(conn);
+      if (conn->state == STATE_END) {
+        // client closed normally, or something bad happened.
+        // destroy this connection
+        rv = epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
+        if (rv < 0) {
+          die("epoll_ctl(del)");
+        }
+        fd2conn[conn->fd] = NULL;
+        (void)close(conn->fd);
+        free(conn);
+      }
     }
   }
 
+  if (close(epoll_fd)) {
+    die("close() epoll");
+  }
   return 0;
 }
