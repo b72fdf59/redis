@@ -56,6 +56,7 @@ struct Conn {
   uint32_t state = 0; // either STATE_REQ or STATE_RES
   // buffer for reading
   size_t rbuf_size = 0;
+  size_t rbuf_read = 0;
   uint8_t rbuf[4 + k_max_msg];
   // buffer for writing
   size_t wbuf_size = 0;
@@ -91,6 +92,7 @@ static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd) {
   conn->fd = connfd;
   conn->state = STATE_REQ;
   conn->rbuf_size = 0;
+  conn->rbuf_read = 0;
   conn->wbuf_size = 0;
   conn->wbuf_sent = 0;
   conn_put(fd2conn, conn);
@@ -107,7 +109,7 @@ static bool try_one_request(Conn *conn) {
     return false;
   }
   uint32_t len = 0;
-  memcpy(&len, &conn->rbuf[0], 4);
+  memcpy(&len, &conn->rbuf[conn->rbuf_read], 4);
   if (len > k_max_msg) {
     msg("too long");
     conn->state = STATE_END;
@@ -119,21 +121,18 @@ static bool try_one_request(Conn *conn) {
   }
 
   // got one request, do something with it
-  printf("client says: %.*s\n", len, &conn->rbuf[4]);
+  printf("client says: %.*s\n", len, &conn->rbuf[conn->rbuf_read + 4]);
 
   // generating echoing response
   memcpy(&conn->wbuf[0], &len, 4);
-  memcpy(&conn->wbuf[4], &conn->rbuf[4], len);
+  memcpy(&conn->wbuf[4], &conn->rbuf[conn->rbuf_read + 4], len);
   conn->wbuf_size = 4 + len;
 
   // remove the request from the buffer.
   // note: frequent memmove is inefficient.
   // note: need better handling for production code.
-  size_t remain = conn->rbuf_size - 4 - len;
-  if (remain) {
-    memmove(conn->rbuf, &conn->rbuf[4 + len], remain);
-  }
-  conn->rbuf_size = remain;
+  conn->rbuf_read += 4 + len;
+  conn->rbuf_size = conn->rbuf_size - 4 - len;
 
   // change state
   conn->state = STATE_RES;
@@ -146,6 +145,12 @@ static bool try_one_request(Conn *conn) {
 static bool try_fill_buffer(Conn *conn) {
   // try to fill the buffer
   assert(conn->rbuf_size < sizeof(conn->rbuf));
+
+  if (conn->rbuf_size) {
+    memmove(conn->rbuf, &conn->rbuf[conn->rbuf_read], conn->rbuf_size);
+  }
+  // reset read buffer
+  conn->rbuf_read = 0;
   ssize_t rv = 0;
   do {
     size_t cap = sizeof(conn->rbuf) - conn->rbuf_size;
@@ -289,7 +294,6 @@ int main() {
       event.events = (conn->state == STATE_REQ) ? POLLIN : POLLOUT;
       event.events = event.events | POLLERR;
       int rv = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &event);
-      std::cout << rv << std::endl;
       if (rv < 0) {
         if (errno == ENOENT) {
           rv = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn->fd, &event);
